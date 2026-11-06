@@ -5,16 +5,24 @@
 Логин и ключ живут в памяти на время проверки и уходят только в API REDSMS. На диск они не пишутся.
 Запросы к серверу требуют токен, который создаётся при запуске, поэтому чужой сайт не сможет запустить
 платную отправку через этот сервер.
+
+Серверный режим (--server) рассчитан на работу за прокси с авторизацией, который подставляет заголовок X-User,
+как в REDSMS «Проекты». Запросы без X-User отклоняются, а запуск, логи и шаблоны у каждого пользователя свои.
+Порт берётся из PORT, префикс адреса из APP_BASE_PATH, данные хранятся в REDSMS_DATA.
+Открывать такой порт напрямую нельзя: заголовку X-User можно доверять только за прокси.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
 import secrets
+import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -30,6 +38,7 @@ DEFAULT_PORT = 8770
 MAX_BODY = 64 * 1024
 MAX_LIVE_LOG = 20000
 MAX_LOG_VIEW = 2 * 1024 * 1024
+MAX_USER_LOGS = 30  # в серверном режиме старые логи удаляются, чтобы не занимать диск контейнера
 LOG_NAME = re.compile(r"redsms_test_\d{8}-\d{6}\.log")
 GROUPS = (
     ("Сообщения", ("sms", "sms_scheduled", "voice", "vk")),
@@ -150,21 +159,18 @@ def make_plan(settings: core.Settings, scenarios: List[core.Scenario], live: boo
     return plan
 
 
-class App:
-    def __init__(self, base_url: str = core.DEFAULT_BASE_URL, interval: float = 5.0, open_log: bool = True,
-                 log_dir: Optional[str] = None, templates_path: Optional[str] = None):
-        here = os.path.dirname(os.path.abspath(core.__file__))
-        self.log_dir = log_dir or here
-        self.templates = templates.TemplateStore(templates_path or os.path.join(here, "redsms_templates.json"))
-        self.token = secrets.token_urlsafe(32)
-        self.base_url = base_url
-        self.interval = interval
-        self.open_log = open_log
+class Space:
+    """Запуск, логи и шаблоны одного пользователя."""
+
+    def __init__(self, app: "App", log_dir: str, templates_path: str):
+        self.app = app
+        self.log_dir = log_dir
+        self.templates = templates.TemplateStore(templates_path)
         self.lock = threading.Lock()
         self.run: Optional[Run] = None
 
     def start(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        settings, scenarios, live = parse_form(data, self.interval)
+        settings, scenarios, live = parse_form(data, self.app.interval)
         login, api_key = text_field(data, "login"), text_field(data, "api_key")
         if not login or not api_key:
             raise ValueError("Укажите логин и API-ключ")
@@ -176,34 +182,51 @@ class App:
                 raise ValueError("Проверка уже идёт")
             run = Run(plan, live)
             self.run = run
-        client = StoppableClient(run.stop, login, api_key, base_url=self.base_url)
+        client = StoppableClient(run.stop, login, api_key, base_url=self.app.base_url)
         threading.Thread(target=self._work, args=(run, client, settings, scenarios, live), daemon=True).start()
         return run.snapshot()
 
+    def _open_log_file(self, run: Run) -> logging.Handler:
+        path = os.path.join(self.log_dir, time.strftime("redsms_test_%Y%m%d-%H%M%S.log"))
+        handler = logging.FileHandler(path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        run.log_path = None if self.app.server_mode else path  # путь внутри контейнера пользователю не нужен
+        return handler
+
+    def _prune_logs(self) -> None:
+        for old in self.log_files()[MAX_USER_LOGS - 1:]:
+            os.unlink(os.path.join(self.log_dir, old["name"]))
+
     def _work(self, run: Run, client: core.Client, settings: core.Settings, scenarios: List[core.Scenario],
               live: bool) -> None:
-        handlers_before = list(core.log.handlers)
+        # Логгер общий на процесс, поэтому каждый запуск забирает только записи своего потока.
+        # Иначе при одновременных проверках лог одного пользователя попадал бы другому.
+        owner = threading.get_ident()
         core.log.setLevel(logging.DEBUG)
-        core.log.addHandler(RunLogHandler(run.log_entries))
+        handlers: List[logging.Handler] = [RunLogHandler(run.log_entries)]
+        state = "crashed"
         try:
-            if self.open_log:
-                run.log_path = core.setup_log_file()
+            if self.app.open_log:
+                if self.app.server_mode:
+                    self._prune_logs()
+                handlers.append(self._open_log_file(run))
+            for handler in handlers:
+                handler.addFilter(lambda record: record.thread == owner)
+                core.log.addHandler(handler)
             core.run_all(client, settings, scenarios, live, run.lines.append, run.results)
-            run.state = "finished"
+            state = "finished"
         except Stopped:
             run.lines.append("Остановлено. Уже созданные сообщения отменить нельзя.")
             core.log.warning("проверка остановлена пользователем")
-            run.state = "stopped"
+            state = "stopped"
         except Exception as e:  # окно должно показать сбой, а не зависнуть в состоянии «идёт»
             core.log.exception("сбой проверки")
             run.lines.append(f"Сбой: {type(e).__name__}: {e}")
-            run.state = "crashed"
         finally:
-            for handler in list(core.log.handlers):
-                if handler not in handlers_before:
-                    core.log.removeHandler(handler)
-                    handler.close()
-
+            for handler in handlers:
+                core.log.removeHandler(handler)
+                handler.close()
+            run.state = state
 
     def live_log(self, since: int) -> Dict[str, Any]:
         run = self.run
@@ -237,6 +260,34 @@ class App:
         return {"name": name, "text": raw.decode("utf-8", errors="replace"), "truncated": size > MAX_LOG_VIEW}
 
 
+class App:
+    def __init__(self, base_url: str = core.DEFAULT_BASE_URL, interval: float = 5.0, open_log: bool = True,
+                 log_dir: Optional[str] = None, templates_path: Optional[str] = None, server_mode: bool = False,
+                 base_path: str = "", data_dir: Optional[str] = None):
+        here = os.path.dirname(os.path.abspath(core.__file__))
+        self.base_url = base_url
+        self.interval = interval
+        self.open_log = open_log
+        self.server_mode = server_mode
+        self.base_path = base_path.rstrip("/")
+        self.data_dir = data_dir or here
+        self.token = secrets.token_urlsafe(32)
+        self.spaces: Dict[str, Space] = {}
+        self.spaces_lock = threading.Lock()
+        self.local = Space(self, log_dir or here, templates_path or os.path.join(here, "redsms_templates.json"))
+
+    def space(self, user: str) -> Space:
+        if not self.server_mode:
+            return self.local
+        with self.spaces_lock:
+            if user not in self.spaces:
+                # Хеш вместо имени: значение заголовка не должно влиять на путь к файлам
+                folder = os.path.join(self.data_dir, hashlib.sha256(user.encode("utf-8")).hexdigest()[:32])
+                os.makedirs(folder, mode=0o700, exist_ok=True)
+                self.spaces[user] = Space(self, folder, os.path.join(folder, "redsms_templates.json"))
+            return self.spaces[user]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "redsms-gui"
     sys_version = ""
@@ -262,7 +313,25 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, status: int, data: Any) -> None:
         self._send(status, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
+    def _route(self) -> Optional[str]:
+        """Путь без префикса APP_BASE_PATH или None, если запрос вне приложения."""
+        path = urllib.parse.urlsplit(self.path).path
+        base = self.app.base_path
+        if not base:
+            return path
+        return path[len(base):] if path == base or path.startswith(base + "/") else None
+
+    def _space(self) -> Optional[Space]:
+        """Пространство пользователя. В серверном режиме без X-User доступа нет."""
+        user = self.headers.get("X-User", "").strip() if self.app.server_mode else ""
+        if self.app.server_mode and not user:
+            self._json(401, {"error": "Нужен вход через REDSMS «Проекты»"})
+            return None
+        return self.app.space(user)
+
     def _host_ok(self) -> bool:
+        if self.app.server_mode:  # адрес задаёт прокси, а доступ проверяется по его заголовку X-User
+            return True
         # Защита от DNS rebinding: страница чужого домена не должна достучаться до сервера
         port = self.server.server_address[1]
         return self.headers.get("Host") in (f"127.0.0.1:{port}", f"localhost:{port}")
@@ -271,43 +340,63 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(self.headers.get("X-Token", "").encode(), self.app.token.encode())
 
     def do_GET(self) -> None:
-        url = urllib.parse.urlsplit(self.path)
-        query = urllib.parse.parse_qs(url.query)
+        path = self._route()
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if not self._host_ok():
             self._json(403, {"error": "Недопустимый адрес"})
-        elif url.path == "/":
+            return
+        if path is None:
+            self._json(404, {"error": "Не найдено"})
+            return
+        space = self._space()
+        if space is None:
+            return
+        if path == "":  # относительные ссылки страницы работают только с «/» на конце адреса
+            self.send_response(302)
+            self.send_header("Location", self.app.base_path + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif path == "/":
             page = PAGE.replace("__TOKEN__", self.app.token).replace("__CATALOG__", catalog_json()) \
-                .replace("__TRAFFIC_TYPES__", json.dumps(templates.TRAFFIC_TYPES, ensure_ascii=False))
+                .replace("__TRAFFIC_TYPES__", json.dumps(templates.TRAFFIC_TYPES, ensure_ascii=False)) \
+                .replace("__PRIVACY__", SERVER_PRIVACY if self.app.server_mode else LOCAL_PRIVACY)
             self._send(200, page.encode("utf-8"), "text/html; charset=utf-8")
-        elif not url.path.startswith("/api/"):
+        elif not path.startswith("/api/"):
             self._json(404, {"error": "Не найдено"})
         elif not self._token_ok():
             self._json(403, {"error": "Неверный токен"})
         else:
             try:
-                self._api_get(url.path, query)
+                self._api_get(space, path, query)
             except ValueError as e:
                 self._json(400, {"error": str(e)})
 
-    def _api_get(self, path: str, query: Dict[str, List[str]]) -> None:
+    def _api_get(self, space: Space, path: str, query: Dict[str, List[str]]) -> None:
         if path == "/api/status":
-            run = self.app.run
+            run = space.run
             self._json(200, run.snapshot() if run else {"state": "idle"})
         elif path == "/api/log":
             since = query.get("since", ["0"])[0]
-            self._json(200, self.app.live_log(int(since) if since.isdigit() else 0))
+            self._json(200, space.live_log(int(since) if since.isdigit() else 0))
         elif path == "/api/logs":
-            self._json(200, {"files": self.app.log_files()})
+            self._json(200, {"files": space.log_files()})
         elif path == "/api/logs/view":
-            self._json(200, self.app.read_log_file(query.get("name", [""])[0]))
+            self._json(200, space.read_log_file(query.get("name", [""])[0]))
         elif path == "/api/templates":
-            self._json(200, {"templates": [templates.describe(t) for t in self.app.templates.list()]})
+            self._json(200, {"templates": [templates.describe(t) for t in space.templates.list()]})
         else:
             self._json(404, {"error": "Не найдено"})
 
     def do_POST(self) -> None:
+        path = self._route()
         if not self._host_ok() or not self._token_ok():
             self._json(403, {"error": "Доступ запрещён"})
+            return
+        if path is None:
+            self._json(404, {"error": "Не найдено"})
+            return
+        space = self._space()
+        if space is None:
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -320,21 +409,21 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(data, dict):
                 raise ValueError("Ожидался JSON-объект")
-            if self.path == "/api/plan":
+            if path == "/api/plan":
                 settings, scenarios, live = parse_form(data, self.app.interval)
                 self._json(200, {"plan": make_plan(settings, scenarios, live), "live": live})
-            elif self.path == "/api/start":
-                self._json(200, self.app.start(data))
-            elif self.path == "/api/templates":
-                self._json(200, {"template": templates.describe(self.app.templates.save(data))})
-            elif self.path == "/api/templates/delete":
-                self.app.templates.delete(data.get("id"))
+            elif path == "/api/start":
+                self._json(200, space.start(data))
+            elif path == "/api/templates":
+                self._json(200, {"template": templates.describe(space.templates.save(data))})
+            elif path == "/api/templates/delete":
+                space.templates.delete(data.get("id"))
                 self._json(200, {"ok": True})
-            elif self.path == "/api/templates/check":
+            elif path == "/api/templates/check":
                 self._json(200, check_template(data))
-            elif self.path == "/api/stop":
-                if self.app.run:
-                    self.app.run.stop.set()
+            elif path == "/api/stop":
+                if space.run:
+                    space.run.stop.set()
                 self._json(200, {"ok": True})
             else:
                 self._json(404, {"error": "Не найдено"})
@@ -364,9 +453,14 @@ def catalog_json() -> str:
     return json.dumps(groups, ensure_ascii=False).replace("<", "\\u003c")
 
 
-def make_server(app: App, port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
+def make_server(app: App, port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {"app": app})
-    return ThreadingHTTPServer(("127.0.0.1", port), handler)
+    return ThreadingHTTPServer((host, port), handler)
+
+
+LOCAL_PRIVACY = "Логин и ключ хранятся только в памяти этого окна и сервера и отправляются только в API REDSMS."
+SERVER_PRIVACY = ("Логин и ключ передаются на сервер проекта, хранятся в памяти только на время проверки и уходят "
+                  "только в API REDSMS. Запуски, логи и шаблоны видны только вам.")
 
 
 PAGE = r"""<!doctype html>
@@ -472,7 +566,7 @@ dialog .skipped { color:var(--muted); font-size:13px; }
 <body>
 <main>
 <h1>Проверка услуг REDSMS</h1>
-<p class="sub">Логин и ключ хранятся только в памяти этого окна и сервера и отправляются только в API REDSMS.</p>
+<p class="sub">__PRIVACY__</p>
 <div class="action" id="action" role="status"></div>
 <nav class="tabs" role="tablist" aria-label="Разделы">
   <button type="button" role="tab" data-tab="run" aria-selected="true">Проверка</button>
@@ -656,7 +750,7 @@ function formData() {
 async function api(path, body) {
   const options = { headers: { "X-Token": TOKEN } };
   if (body !== undefined) { options.method = "POST"; options.headers["Content-Type"] = "application/json"; options.body = JSON.stringify(body); }
-  const r = await fetch(path, options);
+  const r = await fetch(path.slice(1), options);  // относительно страницы: проект может жить под /apps/<имя>/
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || "Ошибка сервера");
   return data;
@@ -1040,12 +1134,36 @@ api("/api/status").then(snap => { if (snap.state !== "idle") { render(snap); if 
 """
 
 
+def serve_for_platform(base_url: str) -> int:
+    base_path = os.environ.get("APP_BASE_PATH", "")
+    if base_path and not re.fullmatch(r"(/[A-Za-z0-9._-]+)+", base_path):
+        print(f"Неверный APP_BASE_PATH: {base_path}", file=sys.stderr)
+        return 2
+    data_dir = os.environ.get("REDSMS_DATA") or os.path.join(tempfile.gettempdir(), "redsms-data")
+    os.makedirs(data_dir, mode=0o700, exist_ok=True)
+    app = App(base_url=base_url, server_mode=True, base_path=base_path, data_dir=data_dir)
+    port = int(os.environ.get("PORT") or DEFAULT_PORT)
+    server = make_server(app, port, "0.0.0.0")
+    print(f"Серверный режим: порт {port}, адрес {base_path or '/'}, данные {data_dir}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Окно проверки услуг REDSMS")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="порт на 127.0.0.1")
     parser.add_argument("--no-browser", action="store_true", help="не открывать браузер автоматически")
+    parser.add_argument("--server", action="store_true", help="режим для сервера за прокси с авторизацией X-User")
     args = parser.parse_args()
-    app = App(base_url=os.environ.get("REDSMS_API_BASE", core.DEFAULT_BASE_URL))
+    base_url = os.environ.get("REDSMS_API_BASE", core.DEFAULT_BASE_URL)
+    if args.server:
+        return serve_for_platform(base_url)
+    app = App(base_url=base_url)
     try:
         server = make_server(app, args.port)
     except OSError:

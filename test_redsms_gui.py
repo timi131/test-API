@@ -162,21 +162,11 @@ class GuiTest(unittest.TestCase):
     def test_key_used_for_signature_and_never_exposed(self) -> None:
         import hashlib
         with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "t.log")
-            original = core.setup_log_file
-
-            def fake_setup() -> str:
-                handler = core.logging.FileHandler(path, encoding="utf-8")
-                core.log.addHandler(handler)
-                core.log.setLevel(core.logging.DEBUG)
-                return path
-
-            core.setup_log_file = fake_setup
-            self.addCleanup(setattr, core, "setup_log_file", original)
+            self.app.local.log_dir = directory
             self.app.open_log = True
             self.call("POST", "/api/start", self.form())
             snap = self.wait_done()
-            with open(path, encoding="utf-8") as f:
+            with open(snap["log_path"], encoding="utf-8") as f:
                 log_text = f.read()
         self.assertTrue(log_text)
         self.assertNotIn(KEY, log_text)
