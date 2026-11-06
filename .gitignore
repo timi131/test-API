@@ -1,4 +1,5 @@
 *.log
+redsms_templates.json
 __pycache__/
 *.pyc
 .DS_Store

@@ -63,7 +63,7 @@ POSITIVE_STATUSES = {
 MIN_VALIDITY = {"sms": 600}  # для остальных каналов 60
 DEFAULT_MIN_VALIDITY = 60
 MAX_VALIDITY = 86400
-POLL_FIELDS = "uuid,status,status_time,child_uuid,type,price,errCode,provider_status,operator"
+POLL_FIELDS = "uuid,status,status_time,child_uuid,type,traffic_type,price,errCode,provider_status,operator"
 PROMPT_PREFIX = "  → "  # строка с действием для человека, например куда звонить
 
 HTTP_HINTS = {
@@ -232,6 +232,7 @@ class Settings:
     vk_text: Optional[str] = None
     viber_from: Optional[str] = None
     pushok_text: str = "phone"
+    expect_traffic: Optional[str] = None  # тип шаблона: текст должен тарифицироваться именно так
     validity: Optional[int] = None
     wait: Optional[float] = None
     interval: float = 5.0
@@ -366,17 +367,26 @@ def skip_reason(scenario: Scenario, settings: Settings, live: bool) -> Optional[
     return None
 
 
-def check_dry(scenario: Scenario, client: Client, body: Dict[str, Any]) -> Result:
+def check_dry(scenario: Scenario, client: Client, settings: Settings, body: Dict[str, Any]) -> Result:
     reply = client.send(body, dry_run=True)
     items = reply.get("items") or []
     if reply.get("errors") or not items or not all(i.get("uuid") for i in items):
         return Result(scenario.name, scenario.title, "ОШИБКА", describe_error(reply) if reply.get("errors")
                       else "в ответе нет сообщений с uuid")
     first = items[0]
-    info = {k: first.get(k) for k in ("operator", "country", "price") if first.get(k) not in (None, "")}
+    info = {k: first.get(k) for k in ("operator", "country", "traffic_type", "price") if first.get(k) not in (None, "")}
     detail = "запрос принят, сообщение не отправлялось"
     if info:
         detail += "; " + ", ".join(f"{k}={v}" for k, v in info.items())
+    if settings.expect_traffic and scenario.routes == ("sms",):
+        actual = first.get("traffic_type")
+        if not actual:
+            detail += f"; тип тарификации не вернулся, совпадение с шаблоном ({settings.expect_traffic}) не подтверждено"
+        elif actual != settings.expect_traffic:
+            # Текст не совпал с зарегистрированным шаблоном: по умолчанию сообщение рекламное (чаты 33750, 33973)
+            return Result(scenario.name, scenario.title, "ОШИБКА",
+                          f"{detail}; ожидался тип {settings.expect_traffic}. Текст не совпал с шаблоном или "
+                          "шаблон не действует у этого оператора")
     return Result(scenario.name, scenario.title, "OK", detail)
 
 
@@ -425,7 +435,7 @@ def run_scenario(scenario: Scenario, client: Client, settings: Settings, live: b
         return Result(scenario.name, scenario.title, "ПРОПУЩЕНО", reason)
     try:
         body = build_body(scenario, settings)
-        return check_live(scenario, client, settings, body, out) if live else check_dry(scenario, client, body)
+        return check_live(scenario, client, settings, body, out) if live else check_dry(scenario, client, settings, body)
     except (ApiError, OSError, ValueError) as e:
         return Result(scenario.name, scenario.title, "ОШИБКА", str(e))
 
@@ -539,6 +549,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--vk-text", help="текст VK по зарегистрированному шаблону")
     p.add_argument("--viber-from", help="имя отправителя Viber")
     p.add_argument("--pushok-text", choices=("enter", "reg", "phone"), default="phone", help="текст окна PushOK")
+    p.add_argument("--expect-traffic", choices=("auth", "service", "info", "transact", "market_template"),
+                   help="в имитации проверить, что SMS тарифицируется как этот тип шаблона")
     p.add_argument("--validity", type=int, help="срок жизни, секунд, для одноканальных услуг (SMS от 600, др. от 60)")
     p.add_argument("--wait", type=float, help="сколько ждать конечный статус, секунд (по умолчанию срок жизни + 60)")
     p.add_argument("--interval", type=float, default=5.0, help="интервал опроса статуса, секунд")
@@ -578,7 +590,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     settings = Settings(to=args.to, to2=args.to2, sms_from=args.sms_from, sms_text=args.sms_text,
                         voice_from=args.voice_from, vk_from=args.vk_from, vk_text=args.vk_text,
-                        viber_from=args.viber_from, pushok_text=args.pushok_text, validity=args.validity,
+                        viber_from=args.viber_from, pushok_text=args.pushok_text, expect_traffic=args.expect_traffic,
+                        validity=args.validity,
                         wait=args.wait, interval=args.interval)
     if args.live and not confirm_live(scenarios, settings, args.yes, sys.stdin.isatty(), input):
         print("Отправка отменена, запросов не было.")
@@ -769,6 +782,31 @@ class DryRunTest(Base):
     def test_dry_run_shows_operator(self) -> None:
         self.fake.send_replies = [sent(operator="mts", country="RU", price=7)]
         self.assertIn("operator=mts", self.run_one("sms", live=False).detail)
+
+    def test_expected_traffic_type_matches(self) -> None:
+        self.settings = replace(self.settings, expect_traffic="auth")
+        self.fake.send_replies = [sent(traffic_type="auth")]
+        result = self.run_one("sms", live=False)
+        self.assertEqual(result.outcome, "OK")
+        self.assertIn("traffic_type=auth", result.detail)
+
+    def test_market_traffic_when_template_expected_is_error(self) -> None:
+        self.settings = replace(self.settings, expect_traffic="auth")
+        self.fake.send_replies = [sent(traffic_type="market")]
+        result = self.run_one("sms", live=False)
+        self.assertEqual(result.outcome, "ОШИБКА")
+        self.assertIn("не совпал с шаблоном", result.detail)
+
+    def test_missing_traffic_type_is_not_claimed_as_match(self) -> None:
+        self.settings = replace(self.settings, expect_traffic="auth")
+        result = self.run_one("sms", live=False)
+        self.assertEqual(result.outcome, "OK")
+        self.assertIn("не подтверждено", result.detail)
+
+    def test_expected_traffic_ignored_for_other_channels(self) -> None:
+        self.settings = replace(self.settings, expect_traffic="auth")
+        self.fake.send_replies = [sent(traffic_type="fcall4")]
+        self.assertEqual(self.run_one("fcall", live=False).outcome, "OK")
 
     def test_dry_run_rejection_is_error(self) -> None:
         self.fake.send_replies = [TEXT_REJECTED]
